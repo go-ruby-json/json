@@ -122,6 +122,18 @@ func ParseBytes(b []byte, opts ...Option) (Value, error) {
 	return Parse(string(b), opts...)
 }
 
+// ParseInto parses a JSON document straight into the host [Builder] dst,
+// reproducing JSON.parse semantics (and its errors) but with no intermediate
+// tree of this package's values — the parser drives dst as it reads, so a host
+// such as go-embedded-ruby materialises its own object graph in a single
+// allocation-light pass. On success dst.Result() holds the top-level value; on a
+// malformed document, nesting overflow or non-string input the matching error is
+// returned and dst's result is unspecified.
+func ParseInto(s string, dst Builder, opts ...Option) error {
+	c := resolve(opts)
+	return parseInto(s, dst, &c)
+}
+
 // Generate renders a Ruby value to a compact JSON document, matching
 // JSON.generate / Object#to_json. The value is drawn from the package value
 // model; a non-finite float without WithAllowNaN returns a [*GeneratorError], and

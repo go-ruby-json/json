@@ -14,25 +14,38 @@ import (
 // parse decodes the document s into a Ruby value per config c, reproducing MRI's
 // JSON.parse semantics and its JSON::ParserError / JSON::NestingError messages.
 func parse(s string, c *config) (Value, error) {
-	p := &parser{s: s, c: c}
-	p.skipSpace()
-	v, err := p.value(0)
-	if err != nil {
+	var b valueBuilder
+	if err := parseInto(s, &b, c); err != nil {
 		return nil, err
+	}
+	return b.Result(), nil
+}
+
+// parseInto decodes the document s straight into the host Builder b per config c,
+// driving it with one streaming pass (no intermediate value tree). It is the
+// engine behind both [parse] (default builder) and the public [ParseInto].
+func parseInto(s string, b Builder, c *config) error {
+	p := &parser{s: s, c: c, b: b}
+	p.skipSpace()
+	if err := p.value(0); err != nil {
+		return err
 	}
 	p.skipSpace()
 	if p.pos != len(p.s) {
 		// Trailing content after a complete value: MRI reports the leftover token.
-		return nil, p.errAt(p.pos, "unexpected token at end of stream "+quoteTok(p.rest()))
+		return p.errAt(p.pos, "unexpected token at end of stream "+quoteTok(p.rest()))
 	}
-	return v, nil
+	return nil
 }
 
-// parser is the recursive-descent JSON reader.
+// parser is the recursive-descent JSON reader. It emits each value into b as it
+// is read, rather than returning a tree, so the host materialises its own object
+// graph in a single pass.
 type parser struct {
 	s   string
 	pos int
 	c   *config
+	b   Builder
 }
 
 // nestingLimit reports the active parse nesting limit, or -1 for unlimited.
@@ -82,10 +95,11 @@ func (p *parser) skipSpace() {
 	}
 }
 
-// value parses one JSON value at the given structure depth.
-func (p *parser) value(depth int) (Value, error) {
+// value parses one JSON value at the given structure depth, emitting it into the
+// builder.
+func (p *parser) value(depth int) error {
 	if p.pos >= len(p.s) {
-		return nil, p.errAt(p.pos, "unexpected end of input")
+		return p.errAt(p.pos, "unexpected end of input")
 	}
 	switch ch := p.s[p.pos]; {
 	case ch == '{':
@@ -95,31 +109,38 @@ func (p *parser) value(depth int) (Value, error) {
 	case ch == '"':
 		s, err := p.parseString()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return s, nil
+		p.b.Str(s)
+		return nil
 	case p.c.allowNaN && strings.HasPrefix(p.rest(), "-Infinity"):
 		p.pos += 9
-		return inf(-1), nil
+		p.b.Float(inf(-1))
+		return nil
 	case ch == '-' || (ch >= '0' && ch <= '9'):
 		return p.number()
 	case strings.HasPrefix(p.rest(), "true"):
 		p.pos += 4
-		return true, nil
+		p.b.Bool(true)
+		return nil
 	case strings.HasPrefix(p.rest(), "false"):
 		p.pos += 5
-		return false, nil
+		p.b.Bool(false)
+		return nil
 	case strings.HasPrefix(p.rest(), "null"):
 		p.pos += 4
-		return nil, nil
+		p.b.Null()
+		return nil
 	case p.c.allowNaN && strings.HasPrefix(p.rest(), "NaN"):
 		p.pos += 3
-		return nan(), nil
+		p.b.Float(nan())
+		return nil
 	case p.c.allowNaN && strings.HasPrefix(p.rest(), "Infinity"):
 		p.pos += 8
-		return inf(1), nil
+		p.b.Float(inf(1))
+		return nil
 	default:
-		return nil, p.unexpectedToken()
+		return p.unexpectedToken()
 	}
 }
 
@@ -155,83 +176,84 @@ func (p *parser) word() string {
 	return p.s[p.pos:end]
 }
 
-// array parses a JSON array body.
-func (p *parser) array(depth int) (Value, error) {
+// array parses a JSON array body, emitting BeginArray/elements/EndArray.
+func (p *parser) array(depth int) error {
 	if lim := p.nestingLimit(); lim >= 0 && depth+1 > lim {
-		return nil, &NestingError{Message: "nesting of " + strconv.Itoa(depth+1) + " is too deep"}
+		return &NestingError{Message: "nesting of " + strconv.Itoa(depth+1) + " is too deep"}
 	}
+	open := p.pos
 	p.pos++ // consume '['
-	arr := []any{}
 	p.skipSpace()
 	if p.pos < len(p.s) && p.s[p.pos] == ']' {
 		p.pos++
-		return arr, nil
+		p.b.BeginArray(0)
+		p.b.EndArray()
+		return nil
 	}
+	p.b.BeginArray(p.countElems(open))
 	for {
 		p.skipSpace()
-		v, err := p.value(depth + 1)
-		if err != nil {
-			return nil, err
+		if err := p.value(depth + 1); err != nil {
+			return err
 		}
-		arr = append(arr, v)
 		p.skipSpace()
 		if p.pos >= len(p.s) {
-			return nil, p.errAt(p.pos, "unexpected end of input")
+			return p.errAt(p.pos, "unexpected end of input")
 		}
 		switch p.s[p.pos] {
 		case ',':
 			p.pos++
 		case ']':
 			p.pos++
-			return arr, nil
+			p.b.EndArray()
+			return nil
 		default:
-			return nil, p.errAt(p.pos, "expected ',' or ']' after array value")
+			return p.errAt(p.pos, "expected ',' or ']' after array value")
 		}
 	}
 }
 
-// object parses a JSON object body, preserving key order in a *Map.
-func (p *parser) object(depth int) (Value, error) {
+// object parses a JSON object body, emitting BeginObject/(Key,value)*/EndObject
+// in document order so the host preserves key order.
+func (p *parser) object(depth int) error {
 	if lim := p.nestingLimit(); lim >= 0 && depth+1 > lim {
-		return nil, &NestingError{Message: "nesting of " + strconv.Itoa(depth+1) + " is too deep"}
+		return &NestingError{Message: "nesting of " + strconv.Itoa(depth+1) + " is too deep"}
 	}
+	open := p.pos
 	p.pos++ // consume '{'
-	m := NewMap()
 	p.skipSpace()
 	if p.pos < len(p.s) && p.s[p.pos] == '}' {
 		p.pos++
-		return m, nil
+		p.b.BeginObject(0)
+		p.b.EndObject()
+		return nil
 	}
+	p.b.BeginObject(p.countElems(open))
 	for {
 		p.skipSpace()
 		if p.pos >= len(p.s) {
-			return nil, p.errAt(p.pos, "expected object key, got EOF")
+			return p.errAt(p.pos, "expected object key, got EOF")
 		}
 		if p.s[p.pos] != '"' {
-			return nil, p.errAt(p.pos, "expected object key, got "+quoteTok(p.rest()))
+			return p.errAt(p.pos, "expected object key, got "+quoteTok(p.rest()))
 		}
 		key, err := p.parseString()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		p.skipSpace()
 		if p.pos >= len(p.s) || p.s[p.pos] != ':' {
-			return nil, p.errAt(p.pos, "expected ':' after object key")
+			return p.errAt(p.pos, "expected ':' after object key")
 		}
 		p.pos++ // consume ':'
 		p.skipSpace()
-		v, err := p.value(depth + 1)
-		if err != nil {
-			return nil, err
-		}
-		if p.c.symbolizeNames {
-			m.Set(Symbol(key), v)
-		} else {
-			m.Set(key, v)
+		p.b.Key(key, p.c.symbolizeNames)
+		if err := p.value(depth + 1); err != nil {
+			return err
 		}
 		p.skipSpace()
 		if p.pos >= len(p.s) {
-			return nil, p.errAt(p.pos, "unexpected end of input")
+			return p.errAt(p.pos, "unexpected end of input")
 		}
 		switch p.s[p.pos] {
 		case ',':
@@ -239,21 +261,78 @@ func (p *parser) object(depth int) (Value, error) {
 			p.skipSpace()
 			// A trailing comma before '}' is MRI's "expected object key, got: '}'".
 			if p.pos < len(p.s) && p.s[p.pos] == '}' {
-				return nil, p.errAt(p.pos, "expected object key, got: "+quoteTok(p.rest()))
+				return p.errAt(p.pos, "expected object key, got: "+quoteTok(p.rest()))
 			}
 		case '}':
 			p.pos++
-			return m, nil
+			p.b.EndObject()
+			return nil
 		default:
-			return nil, p.errAt(p.pos, "expected ',' or '}' after object value, got: "+quoteTok(p.rest()))
+			return p.errAt(p.pos, "expected ',' or '}' after object value, got: "+quoteTok(p.rest()))
 		}
 	}
+}
+
+// countScanCap bounds the pre-sizing scan (countElems) so a container's hint
+// costs O(1) amortised over the parse rather than O(body): pre-sizing is only a
+// hint, so for a body longer than the cap a cheap estimate suffices and the
+// element slice simply grows the rest of the way. Without the cap a deeply
+// nested document would rescan each enclosing body and cost O(depth²).
+const countScanCap = 512
+
+// countElems returns a pre-sizing hint for the container whose opening '[' or
+// '{' is at open: the exact number of top-level elements (array items or object
+// pairs) when the body fits within countScanCap bytes, else a quick estimate. It
+// scans once over the (bounded) body, tracking only nesting depth and skipping
+// string bodies so commas inside strings or nested containers are ignored. A
+// malformed body is harmless here because the real parse re-validates and
+// reports the error. The container is known non-empty (the caller handles the
+// empty case), so the hint is always >= 1.
+func (p *parser) countElems(open int) int {
+	depth := 0
+	commas := 0
+	end := open + countScanCap
+	if end > len(p.s) {
+		end = len(p.s)
+	}
+	for i := open; i < end; i++ {
+		switch p.s[i] {
+		case '"':
+			// Skip the string body, honouring backslash escapes.
+			i++
+			for i < end {
+				if p.s[i] == '\\' {
+					i++
+				} else if p.s[i] == '"' {
+					break
+				}
+				i++
+			}
+		case '[', '{':
+			depth++
+		case ']', '}':
+			depth--
+			if depth == 0 {
+				return commas + 1
+			}
+		case ',':
+			if depth == 1 {
+				commas++
+			}
+		}
+	}
+	// The body did not close within the scan window: return the commas already
+	// seen plus one as a conservative lower-bound hint. Under-shooting merely lets
+	// the element slice grow the rest of the way (amortised O(1)); over-shooting —
+	// e.g. a bytes-based estimate — would badly over-allocate a deeply nested
+	// document, where each level's body is large but holds only a few elements.
+	return commas + 1
 }
 
 // number parses a JSON number, returning an int64 / *big.Int for an integral
 // literal and a float64 otherwise. A malformed numeric literal is MRI's
 // "invalid number" or "unexpected character" depending on the offending prefix.
-func (p *parser) number() (Value, error) {
+func (p *parser) number() error {
 	start := p.pos
 	// Disallow a leading '+' and a bare '.' (MRI: "unexpected character").
 	// (Reached only via the '-'/digit dispatch, so the first char is valid here.)
@@ -271,12 +350,12 @@ func (p *parser) number() (Value, error) {
 	// Leading-zero rule: "0" alone is fine, "01" is invalid.
 	if len(intDigits) > 1 && intDigits[0] == '0' {
 		p.pos = i
-		return nil, p.errAt(start, "invalid number: "+quoteTok(p.s[start:i]))
+		return p.errAt(start, "invalid number: "+quoteTok(p.s[start:i]))
 	}
 	if len(intDigits) == 0 {
 		// e.g. "-" with no digits, or a number-leading char with no integer part.
 		p.pos = i
-		return nil, p.errAt(start, "invalid number: "+quoteTok(p.s[start:i]))
+		return p.errAt(start, "invalid number: "+quoteTok(p.s[start:i]))
 	}
 	// fraction
 	if i < len(p.s) && p.s[i] == '.' {
@@ -288,7 +367,7 @@ func (p *parser) number() (Value, error) {
 		}
 		if i == fs { // "1." with no fraction digits
 			p.pos = i
-			return nil, p.errAt(start, "invalid number: "+quoteTok(p.s[start:i]))
+			return p.errAt(start, "invalid number: "+quoteTok(p.s[start:i]))
 		}
 	}
 	// exponent
@@ -304,7 +383,7 @@ func (p *parser) number() (Value, error) {
 		}
 		if i == es { // "1e" with no exponent digits
 			p.pos = i
-			return nil, p.errAt(start, "invalid number: "+quoteTok(p.s[start:i]))
+			return p.errAt(start, "invalid number: "+quoteTok(p.s[start:i]))
 		}
 	}
 	lit := p.s[start:i]
@@ -314,13 +393,16 @@ func (p *parser) number() (Value, error) {
 		// ErrRange (overflow -> ±Inf, underflow -> 0); MRI returns those values too
 		// (1e400 -> Infinity), so the value is used regardless of the range error.
 		f, _ := strconv.ParseFloat(lit, 64)
-		return f, nil
+		p.b.Float(f)
+		return nil
 	}
 	if n, err := strconv.ParseInt(lit, 10, 64); err == nil {
-		return n, nil
+		p.b.Int(n)
+		return nil
 	}
 	bi, _ := new(big.Int).SetString(lit, 10)
-	return bi, nil
+	p.b.Big(bi)
+	return nil
 }
 
 // parseString parses a JSON string literal beginning at the current '"',
@@ -328,7 +410,26 @@ func (p *parser) number() (Value, error) {
 func (p *parser) parseString() (string, error) {
 	start := p.pos
 	p.pos++ // consume opening '"'
+	// Fast path: scan for the closing quote over a run of ordinary bytes. The
+	// overwhelmingly common string has no backslash escape, so it can be returned
+	// as a direct sub-slice of the input with no Builder and no per-byte copy.
+	bodyStart := p.pos
+	for p.pos < len(p.s) {
+		ch := p.s[p.pos]
+		if ch == '"' {
+			s := p.s[bodyStart:p.pos]
+			p.pos++
+			return s, nil
+		}
+		if ch == '\\' || ch < 0x20 {
+			break // hand off to the slow, escape-aware path below
+		}
+		p.pos++
+	}
+	// Slow path: the string contains an escape (or a control char): build it,
+	// seeding the Builder with the verbatim run already scanned.
 	var sb strings.Builder
+	sb.WriteString(p.s[bodyStart:p.pos])
 	for {
 		if p.pos >= len(p.s) {
 			return "", p.errAt(p.pos, `unexpected end of input, expected closing "`)

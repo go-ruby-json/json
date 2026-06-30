@@ -9,46 +9,67 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+// genPool recycles the scratch byte buffer each generation grows into, so a
+// stream of Generate calls (the common server/log workload) reuses one backing
+// array instead of allocating a fresh strings.Builder per call.
+var genPool = sync.Pool{New: func() any { b := make([]byte, 0, 256); return &b }}
 
 // generate renders v per config c. It tracks nesting depth so an over-deep tree
 // (including a cycle through a *Map / []any) raises a NestingError exactly like
 // MRI.
 func generate(v Value, c *config) (string, error) {
-	var sb strings.Builder
-	g := &gen{c: c, sb: &sb}
+	bp := genPool.Get().(*[]byte)
+	g := &gen{c: c, buf: (*bp)[:0]}
 	if err := g.value(v, 0); err != nil {
+		*bp = g.buf
+		genPool.Put(bp)
 		return "", err
 	}
-	return sb.String(), nil
+	out := string(g.buf)
+	*bp = g.buf
+	genPool.Put(bp)
+	return out, nil
 }
 
-// gen holds the streaming generation state.
+// gen holds the streaming generation state: a scratch byte buffer appended to
+// directly (cheaper than a strings.Builder for byte-level writes and poolable).
 type gen struct {
-	c  *config
-	sb *strings.Builder
+	c   *config
+	buf []byte
 }
 
 // nestingLimit reports the active generate nesting limit, or -1 for unlimited.
 func (g *gen) nestingLimit() int { return nestingLimit(g.c) }
 
+// writeStr appends a literal string to the buffer.
+func (g *gen) writeStr(s string) { g.buf = append(g.buf, s...) }
+
+// writeByte appends one byte to the buffer.
+func (g *gen) writeByte(b byte) { g.buf = append(g.buf, b) }
+
+// writeInt appends the base-10 form of n without an intermediate string.
+func (g *gen) writeInt(n int64) { g.buf = strconv.AppendInt(g.buf, n, 10) }
+
 // value writes one value at the given structure depth.
 func (g *gen) value(v Value, depth int) error {
 	switch x := v.(type) {
 	case nil:
-		g.sb.WriteString("null")
+		g.writeStr("null")
 	case bool:
 		if x {
-			g.sb.WriteString("true")
+			g.writeStr("true")
 		} else {
-			g.sb.WriteString("false")
+			g.writeStr("false")
 		}
 	case int:
-		g.sb.WriteString(strconv.FormatInt(int64(x), 10))
+		g.writeInt(int64(x))
 	case int64:
-		g.sb.WriteString(strconv.FormatInt(x, 10))
+		g.writeInt(x)
 	case *big.Int:
-		g.sb.WriteString(x.String())
+		g.writeStr(x.String())
 	case float32:
 		return g.float(float64(x))
 	case float64:
@@ -97,19 +118,19 @@ func (g *gen) float(f float64) error {
 		if !g.c.allowNaN {
 			return &GeneratorError{Message: "NaN not allowed in JSON"}
 		}
-		g.sb.WriteString("NaN")
+		g.writeStr("NaN")
 	case math.IsInf(f, 1):
 		if !g.c.allowNaN {
 			return &GeneratorError{Message: "Infinity not allowed in JSON"}
 		}
-		g.sb.WriteString("Infinity")
+		g.writeStr("Infinity")
 	case math.IsInf(f, -1):
 		if !g.c.allowNaN {
 			return &GeneratorError{Message: "-Infinity not allowed in JSON"}
 		}
-		g.sb.WriteString("-Infinity")
+		g.writeStr("-Infinity")
 	default:
-		g.sb.WriteString(formatFloat(f))
+		g.writeStr(formatFloat(f))
 	}
 	return nil
 }
@@ -212,24 +233,24 @@ func (g *gen) array(a []any, depth int) error {
 		return genNestingErr(lim)
 	}
 	if len(a) == 0 {
-		g.sb.WriteString("[]")
+		g.writeStr("[]")
 		return nil
 	}
-	g.sb.WriteByte('[')
-	g.sb.WriteString(g.c.arrayNL)
+	g.writeByte('[')
+	g.writeStr(g.c.arrayNL)
 	for i, e := range a {
 		if i > 0 {
-			g.sb.WriteByte(',')
-			g.sb.WriteString(g.c.arrayNL)
+			g.writeByte(',')
+			g.writeStr(g.c.arrayNL)
 		}
 		g.indent(depth + 1)
 		if err := g.value(e, depth+1); err != nil {
 			return err
 		}
 	}
-	g.sb.WriteString(g.c.arrayNL)
+	g.writeStr(g.c.arrayNL)
 	g.indent(depth)
-	g.sb.WriteByte(']')
+	g.writeByte(']')
 	return nil
 }
 
@@ -240,28 +261,28 @@ func (g *gen) object(m *Map, depth int) error {
 		return genNestingErr(lim)
 	}
 	if m.Len() == 0 {
-		g.sb.WriteString("{}")
+		g.writeStr("{}")
 		return nil
 	}
-	g.sb.WriteByte('{')
-	g.sb.WriteString(g.c.objectNL)
+	g.writeByte('{')
+	g.writeStr(g.c.objectNL)
 	for i, p := range m.pairs {
 		if i > 0 {
-			g.sb.WriteByte(',')
-			g.sb.WriteString(g.c.objectNL)
+			g.writeByte(',')
+			g.writeStr(g.c.objectNL)
 		}
 		g.indent(depth + 1)
 		g.writeString(keyString(p.Key))
-		g.sb.WriteString(g.c.spaceB)
-		g.sb.WriteByte(':')
-		g.sb.WriteString(g.c.space)
+		g.writeStr(g.c.spaceB)
+		g.writeByte(':')
+		g.writeStr(g.c.space)
 		if err := g.value(p.Val, depth+1); err != nil {
 			return err
 		}
 	}
-	g.sb.WriteString(g.c.objectNL)
+	g.writeStr(g.c.objectNL)
 	g.indent(depth)
-	g.sb.WriteByte('}')
+	g.writeByte('}')
 	return nil
 }
 
@@ -271,7 +292,7 @@ func (g *gen) indent(depth int) {
 		return
 	}
 	for i := 0; i < depth; i++ {
-		g.sb.WriteString(g.c.indent)
+		g.writeStr(g.c.indent)
 	}
 }
 
@@ -316,33 +337,47 @@ const hexLower = "0123456789abcdef"
 // writeString writes s as a JSON string literal with MRI's escaping: the named
 // escapes for \" \\ \b \f \n \r \t, \u00XX for other control characters, and
 // UTF-8 text (including non-ASCII and the slash) passed through verbatim.
+//
+// It scans byte-wise, not rune-wise: only the ASCII bytes '"', '\\' and the
+// controls (< 0x20) ever need escaping, and every byte of a multi-byte UTF-8
+// sequence is >= 0x80, so non-ASCII text is copied through unexamined. Runs of
+// ordinary bytes are bulk-appended, so an escape-free string (the common case)
+// costs a single copy — far cheaper than decoding every rune.
 func (g *gen) writeString(s string) {
-	g.sb.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			g.sb.WriteString(`\"`)
-		case '\\':
-			g.sb.WriteString(`\\`)
-		case '\n':
-			g.sb.WriteString(`\n`)
-		case '\r':
-			g.sb.WriteString(`\r`)
-		case '\t':
-			g.sb.WriteString(`\t`)
-		case '\f':
-			g.sb.WriteString(`\f`)
-		case '\b':
-			g.sb.WriteString(`\b`)
-		default:
-			if r < 0x20 {
-				g.sb.WriteString(`\u00`)
-				g.sb.WriteByte(hexLower[(r>>4)&0xf])
-				g.sb.WriteByte(hexLower[r&0xf])
-			} else {
-				g.sb.WriteRune(r)
-			}
+	g.writeByte('"')
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 0x20 && c != '"' && c != '\\' {
+			continue
 		}
+		if start < i {
+			g.writeStr(s[start:i])
+		}
+		switch c {
+		case '"':
+			g.writeStr(`\"`)
+		case '\\':
+			g.writeStr(`\\`)
+		case '\n':
+			g.writeStr(`\n`)
+		case '\r':
+			g.writeStr(`\r`)
+		case '\t':
+			g.writeStr(`\t`)
+		case '\f':
+			g.writeStr(`\f`)
+		case '\b':
+			g.writeStr(`\b`)
+		default: // remaining control characters < 0x20
+			g.writeStr(`\u00`)
+			g.writeByte(hexLower[(c>>4)&0xf])
+			g.writeByte(hexLower[c&0xf])
+		}
+		start = i + 1
 	}
-	g.sb.WriteByte('"')
+	if start < len(s) {
+		g.writeStr(s[start:])
+	}
+	g.writeByte('"')
 }
