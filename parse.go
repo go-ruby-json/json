@@ -15,6 +15,7 @@ import (
 // JSON.parse semantics and its JSON::ParserError / JSON::NestingError messages.
 func parse(s string, c *config) (Value, error) {
 	var b valueBuilder
+	b.seed(len(s))
 	if err := parseInto(s, &b, c); err != nil {
 		return nil, err
 	}
@@ -83,15 +84,22 @@ func (p *parser) rest() string { return p.s[p.pos:] }
 // quotes around the literal text.
 func quoteTok(s string) string { return "'" + s + "'" }
 
-// skipSpace advances over JSON whitespace.
+// skipSpace advances over JSON whitespace. The overwhelmingly common byte is an
+// ordinary token character (> ' '), so a single comparison returns immediately;
+// only a byte at or below ' ' falls through to the whitespace test. This matters
+// because compact JSON has no whitespace yet skipSpace is called around every
+// token, so the fast path runs thousands of times per document.
 func (p *parser) skipSpace() {
 	for p.pos < len(p.s) {
-		switch p.s[p.pos] {
-		case ' ', '\t', '\n', '\r':
-			p.pos++
-		default:
+		c := p.s[p.pos]
+		if c > ' ' {
 			return
 		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			p.pos++
+			continue
+		}
+		return
 	}
 }
 
@@ -181,7 +189,6 @@ func (p *parser) array(depth int) error {
 	if lim := p.nestingLimit(); lim >= 0 && depth+1 > lim {
 		return &NestingError{Message: "nesting of " + strconv.Itoa(depth+1) + " is too deep"}
 	}
-	open := p.pos
 	p.pos++ // consume '['
 	p.skipSpace()
 	if p.pos < len(p.s) && p.s[p.pos] == ']' {
@@ -190,7 +197,7 @@ func (p *parser) array(depth int) error {
 		p.b.EndArray()
 		return nil
 	}
-	p.b.BeginArray(p.countElems(open))
+	p.b.BeginArray(0)
 	for {
 		p.skipSpace()
 		if err := p.value(depth + 1); err != nil {
@@ -219,7 +226,6 @@ func (p *parser) object(depth int) error {
 	if lim := p.nestingLimit(); lim >= 0 && depth+1 > lim {
 		return &NestingError{Message: "nesting of " + strconv.Itoa(depth+1) + " is too deep"}
 	}
-	open := p.pos
 	p.pos++ // consume '{'
 	p.skipSpace()
 	if p.pos < len(p.s) && p.s[p.pos] == '}' {
@@ -228,7 +234,7 @@ func (p *parser) object(depth int) error {
 		p.b.EndObject()
 		return nil
 	}
-	p.b.BeginObject(p.countElems(open))
+	p.b.BeginObject(0)
 	for {
 		p.skipSpace()
 		if p.pos >= len(p.s) {
@@ -271,62 +277,6 @@ func (p *parser) object(depth int) error {
 			return p.errAt(p.pos, "expected ',' or '}' after object value, got: "+quoteTok(p.rest()))
 		}
 	}
-}
-
-// countScanCap bounds the pre-sizing scan (countElems) so a container's hint
-// costs O(1) amortised over the parse rather than O(body): pre-sizing is only a
-// hint, so for a body longer than the cap a cheap estimate suffices and the
-// element slice simply grows the rest of the way. Without the cap a deeply
-// nested document would rescan each enclosing body and cost O(depth²).
-const countScanCap = 512
-
-// countElems returns a pre-sizing hint for the container whose opening '[' or
-// '{' is at open: the exact number of top-level elements (array items or object
-// pairs) when the body fits within countScanCap bytes, else a quick estimate. It
-// scans once over the (bounded) body, tracking only nesting depth and skipping
-// string bodies so commas inside strings or nested containers are ignored. A
-// malformed body is harmless here because the real parse re-validates and
-// reports the error. The container is known non-empty (the caller handles the
-// empty case), so the hint is always >= 1.
-func (p *parser) countElems(open int) int {
-	depth := 0
-	commas := 0
-	end := open + countScanCap
-	if end > len(p.s) {
-		end = len(p.s)
-	}
-	for i := open; i < end; i++ {
-		switch p.s[i] {
-		case '"':
-			// Skip the string body, honouring backslash escapes.
-			i++
-			for i < end {
-				if p.s[i] == '\\' {
-					i++
-				} else if p.s[i] == '"' {
-					break
-				}
-				i++
-			}
-		case '[', '{':
-			depth++
-		case ']', '}':
-			depth--
-			if depth == 0 {
-				return commas + 1
-			}
-		case ',':
-			if depth == 1 {
-				commas++
-			}
-		}
-	}
-	// The body did not close within the scan window: return the commas already
-	// seen plus one as a conservative lower-bound hint. Under-shooting merely lets
-	// the element slice grow the rest of the way (amortised O(1)); over-shooting —
-	// e.g. a bytes-based estimate — would badly over-allocate a deeply nested
-	// document, where each level's body is large but holds only a few elements.
-	return commas + 1
 }
 
 // number parses a JSON number, returning an int64 / *big.Int for an integral
@@ -396,13 +346,42 @@ func (p *parser) number() error {
 		p.b.Float(f)
 		return nil
 	}
-	if n, err := strconv.ParseInt(lit, 10, 64); err == nil {
+	// Integer literal. The digits are already validated (no leading zero, non-
+	// empty), so parse them inline — far cheaper than strconv.ParseInt over the
+	// re-sliced literal — and fall back to big.Int only on int64 overflow.
+	if n, ok := parseInt64(intDigits, p.s[start] == '-'); ok {
 		p.b.Int(n)
 		return nil
 	}
 	bi, _ := new(big.Int).SetString(lit, 10)
 	p.b.Big(bi)
 	return nil
+}
+
+// parseInt64 parses a run of decimal digits (already validated) into a signed
+// int64, applying neg for a leading '-'. ok is false when the value does not fit
+// in int64 (the caller then falls back to *big.Int). At most 19 digits can fit,
+// so a longer run overflows immediately; a 19-digit run is accumulated in a
+// uint64 (which cannot overflow at that length) and range-checked against the
+// signed bound.
+func parseInt64(digits string, neg bool) (int64, bool) {
+	if len(digits) > 19 {
+		return 0, false
+	}
+	var n uint64
+	for k := 0; k < len(digits); k++ {
+		n = n*10 + uint64(digits[k]-'0')
+	}
+	if neg {
+		if n > 1<<63 {
+			return 0, false
+		}
+		return -int64(n), true
+	}
+	if n > 1<<63-1 {
+		return 0, false
+	}
+	return int64(n), true
 }
 
 // parseString parses a JSON string literal beginning at the current '"',
