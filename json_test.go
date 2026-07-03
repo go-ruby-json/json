@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -608,6 +609,36 @@ func TestMapAPI(t *testing.T) {
 	z.Set("k", int64(9))
 	if v, _ := z.Get("k"); v != int64(9) {
 		t.Errorf("zero-map get = %#v", v)
+	}
+	// A Map that grows past mapIndexThreshold builds and then uses its hash
+	// index; exercise inserting past the threshold, a hit/miss Get through the
+	// index, and a duplicate-key last-wins update once the index is live.
+	var lm Map
+	n := mapIndexThreshold + 5
+	for i := 0; i < n; i++ {
+		lm.Set("k"+strconv.Itoa(i), int64(i))
+	}
+	if lm.index == nil {
+		t.Fatal("large Map should have built its hash index")
+	}
+	if lm.Len() != n {
+		t.Errorf("large map len = %d, want %d", lm.Len(), n)
+	}
+	if v, ok := lm.Get("k0"); !ok || v != int64(0) {
+		t.Errorf("indexed get k0 = %#v, %v", v, ok)
+	}
+	if v, ok := lm.Get("k" + strconv.Itoa(n-1)); !ok || v != int64(n-1) {
+		t.Errorf("indexed get last = %#v, %v", v, ok)
+	}
+	if _, ok := lm.Get("absent"); ok {
+		t.Error("indexed get of absent key found")
+	}
+	lm.Set("k0", int64(999)) // duplicate update through the live index
+	if v, _ := lm.Get("k0"); v != int64(999) {
+		t.Errorf("indexed dup update = %#v", v)
+	}
+	if lm.Len() != n {
+		t.Errorf("len after dup update = %d, want %d", lm.Len(), n)
 	}
 	if asBigInt(int(5)).Int64() != 5 || asBigInt(int64(6)).Int64() != 6 {
 		t.Error("asBigInt int/int64")

@@ -65,6 +65,12 @@ type valueBuilder struct {
 	stack []frame
 	root  Value
 	done  bool
+	// keys caches the boxed [Value] for each distinct object key seen so far, so
+	// a key that recurs across sibling records (the norm for arrays of objects)
+	// is boxed into an interface once rather than on every occurrence. MRI
+	// likewise deduplicates hash keys (frozen fstrings); the parsed structure is
+	// unchanged — only the interface header is shared. Built lazily on first Key.
+	keys map[string]Value
 }
 
 // frame is one open container on the builder stack.
@@ -108,17 +114,28 @@ func (b *valueBuilder) EndArray() {
 }
 
 func (b *valueBuilder) BeginObject(n int) {
-	m := &Map{pairs: make([]Pair, 0, n), index: make(map[any]int, n)}
-	b.stack = append(b.stack, frame{m: m})
+	// No index map: small objects (the norm) resolve keys by linear scan, and a
+	// Map builds its hash index itself only once it grows past its threshold.
+	b.stack = append(b.stack, frame{m: &Map{pairs: make([]Pair, 0, n)}})
 }
 
 func (b *valueBuilder) Key(s string, symbolize bool) {
 	f := &b.stack[len(b.stack)-1]
-	if symbolize {
-		f.key = Symbol(s)
-	} else {
-		f.key = s
+	if k, ok := b.keys[s]; ok {
+		f.key = k
+		return
 	}
+	var k Value
+	if symbolize {
+		k = Symbol(s)
+	} else {
+		k = s
+	}
+	if b.keys == nil {
+		b.keys = make(map[string]Value, 8)
+	}
+	b.keys[s] = k
+	f.key = k
 }
 
 func (b *valueBuilder) EndObject() {
